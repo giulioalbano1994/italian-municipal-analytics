@@ -1,6 +1,14 @@
 import os
+import sys
 import logging
 from io import BytesIO
+
+# Windows console is cp1252 → emoji in print/log crash. Force UTF-8.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
@@ -147,6 +155,8 @@ class SocioEconomicBot:
         # Sempre istanziato: LLMProcessor gestisce il fallback locale se la chiave manca
         self.llm_processor = LLMProcessor(openai_key or "")
 
+
+
         self.main_keyboard = ReplyKeyboardMarkup(
             [
                 [KeyboardButton("/start"), KeyboardButton("/help")],
@@ -162,6 +172,11 @@ class SocioEconomicBot:
         self.application = Application.builder().token(self.token).build()
         try:
             self.df_manager.load_data()
+            # Give the LLM the real columns + comuni (also avoids a 2nd 90MB read)
+            self.llm_processor.set_context(
+                self.df_manager.available_variables(9999),
+                self.df_manager.comuni_list(),
+            )
         except Exception as e:
             logger.error(f"Errore caricamento dati: {e}")
         self._register_handlers()
@@ -361,12 +376,16 @@ class SocioEconomicBot:
                 return
 
             params = self.llm_processor.process_request(text)
-            df, xlabel, ylabel, meta = self.df_manager.query_data(params)
+            logger.info(f"🔍 Params: {params}")
 
-            # Heuristic: time series if the text suggests it
-            tl = text.lower()
-            if any(k in tl for k in ['line', 'linea', 'andamento', 'nel tempo', 'storico', 'evoluzione']):
-                params.chart_type = ChartType.LINE
+            if params.query_type == QueryType.RANKING:
+                df, xlabel, ylabel, meta = self.df_manager.query_ranking(params)
+                params.chart_type = ChartType.BARH
+            else:
+                df, xlabel, ylabel, meta = self.df_manager.query_data(params)
+                tl = text.lower()
+                if any(k in tl for k in ['andamento', 'nel tempo', 'storico', 'evoluzione', 'trend']):
+                    params.chart_type = ChartType.LINE
 
             if df is None or df.empty:
                 period_label = self._period_label(df, params)
@@ -376,11 +395,16 @@ class SocioEconomicBot:
                 return
 
             # Title & subtitle
-            period_label = self._period_label(df, params)
             metrics_label = ' / '.join(params.metrics or [])
-            comuni_label = ", ".join(params.comuni) if params.comuni else "(tutti i comuni)"
-            title_parts = [metrics_label, comuni_label, period_label]
-            title = " • ".join([p for p in title_parts if p])
+            if params.query_type == QueryType.RANKING:
+                n = params.top_n or 10
+                order = "meno" if params.ascending else "più"
+                lvl = meta.get("level", "comune")
+                title = f"Classifica {metrics_label} • {n} {lvl} {order} • {meta.get('rank_year', '')}"
+            else:
+                period_label = self._period_label(df, params)
+                comuni_label = ", ".join(params.comuni) if params.comuni else "(tutti i comuni)"
+                title = " • ".join([p for p in [metrics_label, comuni_label, period_label] if p])
 
             subtitle = self._subtitle_from_meta(meta)
 
@@ -399,13 +423,6 @@ class SocioEconomicBot:
                 comment = ""
 
             await msg_obj.reply_photo(BytesIO(img), caption=title, reply_markup=self.main_keyboard)
-
-            # Anteprima DF: markdown se disponibile, altrimenti .to_string()
-            try:
-                preview = df.head(15).to_markdown(index=False)
-            except Exception:
-                preview = df.head(15).to_string(index=False)
-            await msg_obj.reply_text(f"🧾 **Anteprima dati (prime 15 righe)**\n\n```\n{preview}\n```", parse_mode=ParseMode.MARKDOWN)
 
             if comment:
                 await msg_obj.reply_text(comment)

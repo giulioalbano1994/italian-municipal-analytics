@@ -1,246 +1,272 @@
 ﻿import os
-import re
 import json
 import logging
-import pandas as pd
-from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+import google.generativeai as genai
 from openai import OpenAI
+
+from modules import catalog
 
 logger = logging.getLogger(__name__)
 
-# -----------------------------
-# ENUMS
-# -----------------------------
+# ---------------------------------------------------------------------
+# ENUM E DATACLASS
+# ---------------------------------------------------------------------
+
 class QueryType(Enum):
-    SINGLE_YEAR = "single_year"
+    SINGLE_COMUNE = "single_comune"
     TIME_SERIES = "time_series"
     CROSS_SECTION = "cross_section"
-    SINGLE_COMUNE = "single_comune"
+    COMPARISON = "comparison"
+    RANKING = "ranking"          # top/bottom N by a metric
+
 
 class ChartType(Enum):
     BAR = "bar"
+    BARH = "barh"                # horizontal bars — readable rankings
     LINE = "line"
     PIE = "pie"
     MAP = "map"
 
-# -----------------------------
-# DATA CLASS
-# -----------------------------
+
 @dataclass
 class QueryParameters:
-    comuni: List[str] = None
-    metrics: List[str] = None
-    query_type: QueryType = QueryType.CROSS_SECTION
-    chart_type: ChartType = ChartType.BAR
-    start_year: Optional[int] = None
-    end_year: Optional[int] = None
-    anno: Optional[int] = None
+    comuni: list[str] | None = None
+    metrics: list[str] | None = None
+    query_type: QueryType | None = None
+    chart_type: ChartType | None = None
+    start_year: int | None = None
+    end_year: int | None = None
+    anno: int | None = None
+    top_n: int | None = None                 # ranking size
+    ascending: bool = False                  # ranking direction (False = top/highest)
+    level: str | None = None                 # aggregation: comune | provincia | regione
 
-# -----------------------------
+
+# ---------------------------------------------------------------------
 # LLM PROCESSOR
-# -----------------------------
+# ---------------------------------------------------------------------
+
 class LLMProcessor:
-    """
-    Interprete ibrido:
-    1️⃣ tenta il parsing locale rule-based (comuni, metriche, periodo)
-    2️⃣ se confidenza < 0.8, chiede a OpenAI di generare i parametri JSON
-    3️⃣ restituisce sempre QueryParameters coerente
-    """
+    def __init__(self, api_key: str):
+        self.api_key = api_key.strip() if api_key else None
+        self.use_openai = bool(api_key and api_key.startswith("sk-"))
+        self.model_name = "gpt-4o-mini" if self.use_openai else "gemini-1.5-flash"
 
-    def __init__(self, api_key: Optional[str] = None, df_path: str = "resources/df_ridotto_bot.csv"):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self.client = OpenAI(api_key=self.api_key) if self.api_key else None
-        self.metric_mapping = self._build_metric_mapping()
-        self.comuni_list = self._load_comuni(df_path)
-
-    # -----------------------------
-    # Public
-    # -----------------------------
-    def process_request(self, user_request: str) -> QueryParameters:
-        """Parsing locale + fallback GPT"""
-        text = (user_request or "").strip()
-        local_params, confidence = self._local_parse(text)
-
-        if confidence >= 0.8 or not self.client:
-            logger.info(f"✅ Parsing locale (confidence={confidence:.2f})")
-            return local_params
-
-        # fallback LLM
-        logger.info(f"🤖 Invio a LLM (confidence={confidence:.2f})")
-        prompt = self._build_llm_prompt(text)
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "system", "content": prompt},
-                          {"role": "user", "content": text}],
-                temperature=0.2,
-            )
-            content = response.choices[0].message.content
-            params = self._parse_llm_response(content)
-            if params:
-                logger.info("✅ Risposta LLM interpretata correttamente")
-                return params
-        except Exception as e:
-            logger.warning(f"⚠️ Errore nel parsing LLM: {e}")
-
-        logger.info("🔁 Ritorno al fallback locale")
-        return local_params
-
-    # -----------------------------
-    # Local parsing (rule-based)
-    # -----------------------------
-    def _local_parse(self, text: str) -> Tuple[QueryParameters, float]:
-        """Parsing semplice ma robusto basato su regole"""
-        t = text.lower()
-        params = QueryParameters(comuni=[], metrics=[])
-
-        # --- riconosci comuni ---
-        comuni_trovati = [c for c in self.comuni_list if c.lower() in t]
-        if comuni_trovati:
-            params.comuni = comuni_trovati
-
-        # --- metriche ---
-        found_metric = None
-        for k, v in self.metric_mapping.items():
-            if k in t:
-                found_metric = v
-                params.metrics = [v]
-                break
-
-        # --- tipo di query ---
-        if "nel tempo" in t or "serie" in t or "andamento" in t:
-            params.query_type = QueryType.TIME_SERIES
-            params.chart_type = ChartType.LINE
-        elif "mappa" in t or "region" in t or "provinc" in t:
-            params.query_type = QueryType.CROSS_SECTION
-            params.chart_type = ChartType.MAP
+        if self.use_openai:
+            logger.info(f"🤖 OpenAI attivo (modello {self.model_name})")
+            self.client = OpenAI(api_key=self.api_key)
         else:
-            params.query_type = QueryType.CROSS_SECTION
-            params.chart_type = ChartType.BAR
+            logger.info(f"🌐 Gemini attivo (modello {self.model_name})")
+            genai.configure(api_key=self.api_key)
+            self.model = genai.GenerativeModel(self.model_name)
 
-        # --- periodo ---
-        anni = re.findall(r"20\d{2}", t)
-        if len(anni) == 1:
-            params.anno = int(anni[0])
-        elif len(anni) >= 2:
-            params.start_year, params.end_year = int(anni[0]), int(anni[1])
+        # Legacy synonym map (kept as a base; the real catalog is loaded below)
+        self.metric_mapping = self._build_metric_mapping()
 
-        # --- confidence ---
-        conf = 0.0
-        if found_metric:
-            conf += 0.4
-        if comuni_trovati:
-            conf += 0.4
-        if "tempo" in t or "anni" in t:
-            conf += 0.2
+        # Variable catalog (dictionary) → injected into the prompt + resolver.
+        dict_path = os.getenv("VARIABLES_DICT", "resources/dizionario_variabili.csv")
+        self.catalog = catalog.load_catalog(dict_path)
+        self.columns = []          # real df columns (set via set_context after load)
+        self.comuni_list = []
+        self.syn_index = {}
+        self._catalog_block = ""
+        self._parse_cache = {}     # normalized question -> QueryParameters
 
-        return params, min(conf, 1.0)
+    # -----------------------------------------------------------------
+    def set_context(self, columns, comuni):
+        """Called once after the dataframe is loaded: give the LLM the real column
+        names (for the prompt) and the resolver its synonym index. Avoids re-reading
+        the 90 MB CSV just to list comuni/columns."""
+        self.columns = list(columns or [])
+        self.comuni_list = list(comuni or [])
+        self.syn_index = catalog.synonym_index(self.catalog, self.columns)
+        self._catalog_block = catalog.prompt_lines(self.catalog, self.columns)
+        self._parse_cache.clear()
+        logger.info(f"🧭 LLM context: {len(self.columns)} colonne, {len(self.comuni_list)} comuni, "
+                    f"{len(self.syn_index)} sinonimi indicizzati")
 
-    # -----------------------------
-    # Prompt builder for GPT
-    # -----------------------------
-    def _build_llm_prompt(self, text: str) -> str:
+    def resolve_metric(self, term: str):
+        """Map an LLM/user term to a real column, or None."""
+        return catalog.resolve(term, self.columns, self.syn_index)
+
+    # -----------------------------------------------------------------
+    def _build_metric_mapping(self):
         """
-        Costruisce un prompt chiaro per l’LLM.
-        Il modello deve restituire solo un JSON strutturato.
+        Mappa semantica aggiornata per dataset socioeconomico comunale.
         """
-        examples = """
-ESEMPI DI RICHIESTE E RISPOSTE CORRETTE:
-
-Utente: "Popolazione Bari e Napoli nel tempo"
-Risposta:
-{"comuni":["Bari","Napoli"],"metrics":["pop_totale"],"query_type":"time_series","chart_type":"line"}
-
-Utente: "Reddito medio Torino 2015-2023"
-Risposta:
-{"comuni":["Torino"],"metrics":["average_income"],"query_type":"time_series","chart_type":"line","start_year":2015,"end_year":2023}
-
-Utente: "Gini index Firenze ultimo anno"
-Risposta:
-{"comuni":["Firenze"],"metrics":["gini_index"],"query_type":"cross_section","chart_type":"bar"}
-
-Utente: "Quota pensionati Roma e Milano"
-Risposta:
-{"comuni":["Roma","Milano"],"metrics":["pensionati_percentuale"],"query_type":"cross_section","chart_type":"bar"}
-
-Utente: "Laureati residenti Bologna"
-Risposta:
-{"comuni":["Bologna"],"metrics":["laureati_percentuale"],"query_type":"cross_section","chart_type":"bar"}
-
-Utente: "Imprese attive Napoli nel tempo"
-Risposta:
-{"comuni":["Napoli"],"metrics":["imprese_attive"],"query_type":"time_series","chart_type":"line"}
-
-Utente: "Confronto redditi tra Milano, Roma e Torino nel 2022"
-Risposta:
-{"comuni":["Milano","Roma","Torino"],"metrics":["average_income"],"query_type":"single_year","chart_type":"bar","anno":2022}
-"""
-        available_metrics = ", ".join(sorted(set(self.metric_mapping.values())))
-        return (
-            "Sei un parser di richieste in linguaggio naturale per dati socio-economici comunali italiani.\n"
-            "Il tuo compito è estrarre le seguenti informazioni e restituirle SOLO come JSON valido:\n"
-            " - comuni (lista di nomi di città)\n"
-            " - metrics (lista di variabili disponibili)\n"
-            " - query_type (time_series, cross_section, single_year)\n"
-            " - chart_type (line, bar, map)\n"
-            " - start_year, end_year o anno se presenti\n\n"
-            f"Variabili disponibili: {available_metrics}\n\n"
-            f"{examples}\n\n"
-            "Rispondi SOLO con JSON. Nessun commento, nessun testo fuori dal JSON."
-        )
-
-    # -----------------------------
-    # Parse LLM response
-    # -----------------------------
-    def _parse_llm_response(self, content: str) -> Optional[QueryParameters]:
-        try:
-            json_str = re.search(r"\{.*\}", content, re.DOTALL)
-            if not json_str:
-                return None
-            data = json.loads(json_str.group(0))
-            params = QueryParameters()
-            params.comuni = data.get("comuni", [])
-            params.metrics = data.get("metrics", [])
-            params.query_type = QueryType(data.get("query_type", "cross_section"))
-            params.chart_type = ChartType(data.get("chart_type", "bar"))
-            params.start_year = data.get("start_year")
-            params.end_year = data.get("end_year")
-            params.anno = data.get("anno")
-            return params
-        except Exception as e:
-            logger.warning(f"Errore parsing JSON LLM: {e}")
-            return None
-
-    # -----------------------------
-    # Helpers
-    # -----------------------------
-    def _load_comuni(self, df_path: str) -> List[str]:
-        try:
-            df = pd.read_csv(df_path, usecols=["comune"])
-            comuni = sorted(df["comune"].dropna().unique().tolist())
-            logger.info(f"🗺️ Comuni caricati: {len(comuni)}")
-            return comuni
-        except Exception as e:
-            logger.warning(f"⚠️ Errore caricamento comuni: {e}")
-            return []
-
-    def _build_metric_mapping(self) -> dict:
         return {
-            "popolazione": "pop_totale",
-            "abitanti": "pop_totale",
-            "reddito": "average_income",
-            "redditi": "average_income",
-            "ricchezza": "average_income",
+            # Reddito e fisco
+            "reddito": "reddito_imponibile_ammontare_in_euro",
+            "redditi": "reddito_imponibile_ammontare_in_euro",
+            "ricchezza": "reddito_imponibile_ammontare_in_euro",
+            "contribuenti": "numero_contribuenti",
+            "imposta": "imposta_netta_ammontare_in_euro",
+            "addizionale": "addizionale_regionale_dovuta_ammontare_in_euro",
+
+            # Popolazione
+            "popolazione": "popolazione",
+            "abitanti": "popolazione",
+            "residenti": "popolazione",
+
+            # Istruzione
+            "laureati": "laureati_res_tot",
+            "laureati donne": "laureati_res_femmine",
+            "laureati uomini": "laureati_res_maschi",
+
+            # Disuguaglianza
             "gini": "gini_index",
             "disuguaglianza": "gini_index",
-            "pensionati": "pensionati_percentuale",
-            "pensione": "pensionati_percentuale",
-            "laureati": "laureati_percentuale",
-            "imprese": "imprese_attive",
-            "aziende": "imprese_attive",
-            "tasse": "tax_revenue_per_capita",
-            "entrate": "tax_revenue_per_capita"
+
+            # Imprese
+            "imprese registrate": "imprese_registrate_prov",
+            "imprese attive": "imprese_attive_prov",
+            "imprese saldo": "imprese_saldo_prov",
+
+            # Migrazioni
+            "saldo migratorio": "saldo_migratorio_tot_com",
+            "saldo estero": "saldo_migratorio_estero_com",
+
+            # Innovazione
+            "brevetti": "brevetti_num_prov",
+            "brevetti percentuale": "brevetti_pct_prov",
+
+            # Merci e traffico
+            "merci": "merci_scaricate_tonnellate",
         }
 
+    # -----------------------------------------------------------------
+    def _prompt_template(self):
+        """Prompt with the REAL variable catalog so the model returns valid columns."""
+        vars_block = self._catalog_block or "(catalogo non disponibile)"
+        return (
+            "Sei un assistente che traduce richieste in parametri strutturati per un motore di grafici "
+            "su dati socio-economici dei comuni italiani.\n"
+            'Rispondi SOLO con JSON valido (virgolette doppie), formato:\n'
+            '{"comuni": [], "metrics": [], "query_type": "", "chart_type": "", '
+            '"start_year": null, "end_year": null, "anno": null, '
+            '"top_n": null, "ascending": false, "level": null}\n\n'
+            "IMPORTANTE: in 'metrics' usa ESCLUSIVAMENTE i nomi colonna elencati qui sotto "
+            "(scegli quelli più pertinenti alla domanda). Non inventare nomi.\n\n"
+            "COLONNE DISPONIBILI (nome: sinonimi):\n"
+            f"{vars_block}\n\n"
+            "Regole:\n"
+            "- 'nel tempo/andamento/evoluzione' → query_type 'time_series', chart_type 'line'.\n"
+            "- confronto tra più città → 'comparison', 'bar'.\n"
+            "- un solo comune senza anni → 'cross_section'.\n"
+            "- 'classifica/top/i primi/i più .../i migliori' → query_type 'ranking', chart_type 'barh', "
+            "top_n = numero richiesto (default 10), ascending=false; per 'i meno/i peggiori/i più bassi' ascending=true.\n"
+            "- aggregazione territoriale: 'per regione'/'tra le regioni' → level 'regione'; "
+            "'per provincia' → level 'provincia'; altrimenti level 'comune'.\n"
+            "- 'mappa' o 'distribuzione territoriale' → 'map'.\n"
+            "- percentuale/quota/pro capite → usa le colonne derivate (reddito_medio, laureati_pct, "
+            "imprese_attive_ratio, saldo_migratorio_pct) se pertinenti.\n"
+            "- anni = numeri interi; 'comuni' con l'iniziale maiuscola.\n"
+        )
+
+    # -----------------------------------------------------------------
+    def process_request(self, text: str) -> QueryParameters:
+        """
+        Elabora una richiesta utente (testo) e restituisce i parametri strutturati.
+        """
+        logger.info(f"🧠 Elaborazione query utente: {text}")
+
+        cache_key = " ".join((text or "").lower().split())
+        if cache_key in self._parse_cache:
+            logger.info("⚡ Parse da cache")
+            return self._parse_cache[cache_key]
+
+        prompt = self._prompt_template()
+
+        if self.use_openai:
+            logger.info(f"🚀 Invio a OpenAI ({self.model_name})")
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": text},
+                ],
+                max_tokens=300,
+            )
+            content = response.choices[0].message.content
+        else:
+            logger.info(f"🚀 Invio a Gemini ({self.model_name})")
+            response = self.model.generate_content(prompt + "\n\nUtente: " + text)
+            content = response.text
+
+        try:
+            content_clean = content.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(content_clean)
+            logger.info(f"🧾 Risposta grezza dal modello: {content_clean[:200]}...")
+        except Exception as e:
+            logger.warning(f"⚠️ Parsing JSON fallito: {e} | Testo: {content}")
+            parsed = {}
+
+        # Map every returned metric to a REAL column (repairs near-misses); drop
+        # what can't be resolved so a bad name never silently empties the result.
+        raw_metrics = parsed.get("metrics") or []
+        resolved, unknown = [], []
+        for m in raw_metrics:
+            col = self.resolve_metric(m)
+            (resolved if col else unknown).append(col or m)
+        # dedup, preserve order
+        resolved = list(dict.fromkeys(resolved))
+        if unknown:
+            logger.info(f"⚠️ Metriche non risolte: {unknown}")
+
+        def _to_int(v):
+            try:
+                return int(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        def _enum(E, val, default):
+            try:
+                return E(val)
+            except (ValueError, TypeError):
+                return default
+
+        level = parsed.get("level")
+        level = level.lower() if isinstance(level, str) and level.lower() in (
+            "comune", "provincia", "regione") else None
+
+        params = QueryParameters(
+            comuni=parsed.get("comuni", []),
+            metrics=resolved,
+            query_type=_enum(QueryType, parsed.get("query_type"), QueryType.TIME_SERIES),
+            chart_type=_enum(ChartType, parsed.get("chart_type"), ChartType.LINE),
+            start_year=_to_int(parsed.get("start_year")),
+            end_year=_to_int(parsed.get("end_year")),
+            anno=_to_int(parsed.get("anno")),
+            top_n=_to_int(parsed.get("top_n")),
+            ascending=bool(parsed.get("ascending", False)),
+            level=level,
+        )
+
+        logger.info(f"✅ Parametri estratti: {params}")
+        self._parse_cache[cache_key] = params
+        return params
+
+    # -----------------------------------------------------------------
+    def generate_commentary(self, df, params: QueryParameters) -> str:
+        """
+        Crea un breve commento descrittivo sui dati (trend, confronti, variazioni percentuali).
+        """
+        try:
+            if df is None or df.empty:
+                return ""
+            num = df.select_dtypes("number").drop(columns=["anno"], errors="ignore")
+            if num.empty:
+                return ""
+            bits = []
+            for c in num.columns[:4]:
+                s = num[c].dropna()
+                if s.empty:
+                    continue
+                last, first = s.iloc[-1], s.iloc[0]
+                arrow = "📈" if last > first else "📉" if last < first else "➡️"
+                bits.append(f"*{c}*: {last:,.0f} {arrow}".replace(",", "."))
+            return "🔎 " + "  |  ".join(bits) if bits else ""
+        except Exception:
+            return ""
