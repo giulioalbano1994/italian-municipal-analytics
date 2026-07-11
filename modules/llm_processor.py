@@ -259,14 +259,56 @@ class LLMProcessor:
             num = df.select_dtypes("number").drop(columns=["anno"], errors="ignore")
             if num.empty:
                 return ""
-            bits = []
-            for c in num.columns[:4]:
+            stats = {}
+            for c in num.columns[:6]:
                 s = num[c].dropna()
                 if s.empty:
                     continue
-                last, first = s.iloc[-1], s.iloc[0]
-                arrow = "📈" if last > first else "📉" if last < first else "➡️"
-                bits.append(f"*{c}*: {last:,.0f} {arrow}".replace(",", "."))
-            return "🔎 " + "  |  ".join(bits) if bits else ""
+                stats[c] = {"first": round(float(s.iloc[0]), 2), "last": round(float(s.iloc[-1]), 2),
+                            "min": round(float(s.min()), 2), "max": round(float(s.max()), 2), "n": len(s)}
+            if not stats:
+                return ""
+            metric_label = ", ".join(params.metrics or []) or "indicatore"
+
+            llm_text = self._commentary_llm(stats, metric_label)
+            if llm_text:
+                return llm_text
+
+            # --- fallback numerico (senza LLM) ---
+            lines = ["📊 *In breve*"]
+            for c, s in stats.items():
+                arrow = "📈" if s["last"] > s["first"] else "📉" if s["last"] < s["first"] else "➡️"
+                delta = (s["last"] - s["first"]) / s["first"] * 100 if s["first"] else 0
+                lines.append(f"• *{c}*: {s['last']:,.0f} {arrow} ({delta:+.1f}% dal primo dato)"
+                             .replace(",", "."))
+            return "\n".join(lines)
         except Exception:
+            return ""
+
+    def _commentary_llm(self, stats: dict, metric_label: str) -> str:
+        """Breve commento discorsivo (titolo + 3 spunti + sintesi), IT, Markdown."""
+        details = [f"- {c}: inizio {s['first']}, fine {s['last']}, min {s['min']}, max {s['max']} ({s['n']} punti)"
+                   for c, s in stats.items()]
+        prompt = (
+            "Sei un analista socio-economico che scrive per Telegram, chiaro e non accademico. "
+            f"Indicatore: {metric_label}. Dati (per serie/comune):\n" + "\n".join(details) + "\n\n"
+            "Scrivi in ITALIANO per Telegram. Usa SOLO *grassetto* per enfasi, "
+            "NON usare '#', '##' o altri header Markdown.\n"
+            "1) una riga di titolo in *grassetto* con UNA emoji che coglie la storia;\n"
+            "2) 3 punti che iniziano con '• ' con confronti/variazioni concreti basati SOLO sui numeri sopra;\n"
+            "3) una riga finale che inizia con '*In sintesi:*'.\n"
+            "Ogni riga ≤ 22 parole, niente invenzioni, niente disclaimer, niente '#'."
+        )
+        try:
+            if self.use_openai:
+                r = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "system", "content": "Analista dati socio-economici, conciso."},
+                              {"role": "user", "content": prompt}],
+                    temperature=0.5, max_tokens=240)
+                return r.choices[0].message.content.strip()
+            resp = self.model.generate_content(prompt)
+            return (resp.text or "").strip()
+        except Exception as e:
+            logger.warning(f"commentary LLM failed: {e}")
             return ""

@@ -198,13 +198,15 @@ class SocioEconomicBot:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         msg = (
-            f"Ciao {user.first_name}! 👋\n\n"
-            "Sono il tuo bot sui dati socio-economici 🇮🇹\n\n"
-            "Esempi pronti:\n"
-            "• Popolazione Bari e Napoli nel tempo\n"
-            "• Reddito medio a Milano 2010–2020\n"
-            "• Quota pensionati Roma e Firenze\n\n"
-            "Scrivi la tua richiesta o usa /help."
+            f"Ciao *{user.first_name}*! 👋\n\n"
+            "Sono il tuo bot sui *dati socio-economici dei comuni italiani* 🇮🇹\n"
+            "Scrivimi in linguaggio naturale e ti rispondo con un grafico e un commento.\n\n"
+            "💬 *Prova a scrivere:*\n"
+            "• `Reddito medio Bari e Napoli nel tempo`\n"
+            "• `Classifica 10 comuni più ricchi`\n"
+            "• `Laureati per regione`\n\n"
+            "🎲 *Pulsanti:*  /plot = grafico casuale · /map = mappa casuale\n"
+            "ℹ️ /help per gli esempi · /info per le fonti"
         )
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=self.main_keyboard)
         log_message(user, msg, "RESPONSE", "OUT", query_type="START")
@@ -225,8 +227,10 @@ class SocioEconomicBot:
         """
         msg = (
             "📘 *Come usare il bot*\n\n"
-            "Puoi chiedermi dati, confronti o serie storiche sui comuni italiani 🇮🇹\n\n"
-            "✨ *Esempi rapidi (clicca per generare il grafico):*"
+            "Chiedimi dati, confronti, classifiche o mappe sui comuni italiani 🇮🇹\n\n"
+            "Scelgo io il grafico più adatto e aggiungo un breve commento.\n"
+            "🎲 /plot = grafico casuale · 🗺️ /map = mappa casuale\n\n"
+            "✨ *Esempi rapidi (tocca per generare):*"
         )
         rows = [
             [InlineKeyboardButton(text=label, callback_data=f"EXAMPLE:{code}")]
@@ -360,82 +364,114 @@ class SocioEconomicBot:
 
     # ---------- /plot ----------
     async def plot_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_input: str = None):
-        # message object (supporta callback)
         msg_obj = update.message or (update.callback_query.message if getattr(update, "callback_query", None) else None)
         user = update.effective_user
         text = user_input or ("" if not context.args else " ".join(context.args))
-        if not text:
-            await msg_obj.reply_text("❓ Usa `/plot popolazione Milano` o simili.", parse_mode=ParseMode.MARKDOWN)
-            return
+        random_mode = not text.strip()
 
-        processing_msg = await msg_obj.reply_text("🔄 Sto elaborando la tua richiesta...")
-
+        processing_msg = await msg_obj.reply_text(
+            "🎲 Genero un grafico casuale…" if random_mode else "🔄 Elaboro la richiesta…")
         try:
-            if self.llm_processor is None:
-                await processing_msg.edit_text("❌ LLM non configurato. Aggiungi OPENAI_API_KEY nel .env")
-                return
-
-            params = self.llm_processor.process_request(text)
+            params = self._random_params() if random_mode else self.llm_processor.process_request(text)
             logger.info(f"🔍 Params: {params}")
-
-            if params.query_type == QueryType.RANKING:
-                df, xlabel, ylabel, meta = self.df_manager.query_ranking(params)
-                params.chart_type = ChartType.BARH
-            else:
-                df, xlabel, ylabel, meta = self.df_manager.query_data(params)
-                tl = text.lower()
-                if any(k in tl for k in ['andamento', 'nel tempo', 'storico', 'evoluzione', 'trend']):
-                    params.chart_type = ChartType.LINE
-
-            if df is None or df.empty:
-                period_label = self._period_label(df, params)
-                detail = f"\n\n🔎 Parametri: comuni={params.comuni or '—'}, metrics={params.metrics or '—'}, periodo={period_label or '—'}"
-                hint = "\n💡 Prova: `Popolazione Bari e Napoli nel tempo` oppure usa /help"
-                await processing_msg.edit_text("❌ Nessun dato trovato." + detail + hint, parse_mode=ParseMode.MARKDOWN)
-                return
-
-            # Title & subtitle
-            metrics_label = ' / '.join(params.metrics or [])
-            if params.query_type == QueryType.RANKING:
-                n = params.top_n or 10
-                order = "meno" if params.ascending else "più"
-                lvl = meta.get("level", "comune")
-                title = f"Classifica {metrics_label} • {n} {lvl} {order} • {meta.get('rank_year', '')}"
-            else:
-                period_label = self._period_label(df, params)
-                comuni_label = ", ".join(params.comuni) if params.comuni else "(tutti i comuni)"
-                title = " • ".join([p for p in [metrics_label, comuni_label, period_label] if p])
-
-            subtitle = self._subtitle_from_meta(meta)
-
-            img = self.chart_generator.generate_chart(
-                df,
-                chart_type=(getattr(params.chart_type, 'value', params.chart_type)),
-                title=title, subtitle=subtitle, xlabel=xlabel, ylabel=ylabel
-            )
-
-            # Optional: quick commentary (silenzioso se LLM non disponibile)
-            comment = ""
-            try:
-                if self.llm_processor:
-                    comment = self.llm_processor.generate_commentary(df, params)
-            except Exception:
-                comment = ""
-
-            await msg_obj.reply_photo(BytesIO(img), caption=title, reply_markup=self.main_keyboard)
-
-            if comment:
-                await msg_obj.reply_text(comment)
-
-            try:
-                await processing_msg.delete()
-            except Exception:
-                pass
-
+            await self._run_plot(msg_obj, user, params, processing_msg, random_mode)
         except Exception as e:
             logger.exception("Errore nella generazione del grafico")
             await processing_msg.edit_text("❌ Errore durante l'elaborazione. Riprova.")
             log_message(user, str(e), "ERROR", "OUT")
+
+    async def _run_plot(self, msg_obj, user, params: QueryParameters, processing_msg, random_mode=False):
+        if params.query_type == QueryType.RANKING:
+            df, xlabel, ylabel, meta = self.df_manager.query_ranking(params)
+        else:
+            df, xlabel, ylabel, meta = self.df_manager.query_data(params)
+            if df is not None and not df.empty:
+                # il sistema sceglie il grafico più adatto dalla forma dei dati
+                params.chart_type = self.df_manager.choose_chart(meta.get("x_col", "anno"), df, params)
+
+        if df is None or df.empty:
+            await processing_msg.edit_text(
+                "❌ Nessun dato trovato.\n💡 Prova: `Popolazione Bari e Napoli nel tempo`, "
+                "`Classifica 10 comuni più ricchi`, oppure /help",
+                parse_mode=ParseMode.MARKDOWN)
+            return
+
+        title = self._build_title(df, params, meta)
+        subtitle = self._subtitle_from_meta(meta)
+        ylabel = self._pretty_metric(ylabel)  # etichetta asse leggibile
+
+        img = self.chart_generator.generate_chart(
+            df, chart_type=getattr(params.chart_type, "value", params.chart_type),
+            title=title, subtitle=subtitle, xlabel=xlabel, ylabel=ylabel)
+
+        caption = ("🎲 *Grafico casuale*\n" if random_mode else "") + f"*{title}*"
+        await msg_obj.reply_photo(BytesIO(img), caption=caption,
+                                  parse_mode=ParseMode.MARKDOWN, reply_markup=self.main_keyboard)
+
+        comment = ""
+        try:
+            comment = self.llm_processor.generate_commentary(df, params)
+        except Exception:
+            comment = ""
+        if comment:
+            try:
+                await msg_obj.reply_text(comment, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await msg_obj.reply_text(comment)  # plain se il Markdown si rompe
+
+        try:
+            await processing_msg.delete()
+        except Exception:
+            pass
+        log_message(user, title, "RESPONSE", "OUT",
+                    query_type=(params.query_type.value if params.query_type else ""),
+                    comuni=params.comuni, metrics=params.metrics)
+
+    def _build_title(self, df: pd.DataFrame, params: QueryParameters, meta: dict) -> str:
+        metric = self._pretty_metric(" / ".join(params.metrics or []))
+        if params.query_type == QueryType.RANKING:
+            n = params.top_n or 10
+            order = "più bassi" if params.ascending else "più alti"
+            lvl = {"comune": "comuni", "provincia": "province", "regione": "regioni"}.get(
+                meta.get("level", "comune"), "comuni")
+            return f"{metric} — {n} {lvl} {order} ({meta.get('rank_year', '')})"
+        period = self._period_label(df, params)
+        who = ", ".join(params.comuni) if params.comuni else "Italia"
+        return " • ".join([p for p in [metric, who, period] if p])
+
+    # nomi colonna → etichette leggibili
+    PRETTY = {
+        "reddito_medio": "Reddito medio", "pop_totale": "Popolazione", "popolazione": "Popolazione",
+        "laureati_pct": "Laureati (%)", "gini_index": "Indice di Gini",
+        "imprese_attive_prov": "Imprese attive", "imprese_registrate_prov": "Imprese registrate",
+        "saldo_migratorio_pct": "Saldo migratorio (%)", "saldo_migratorio_tot_com": "Saldo migratorio",
+        "reddito_da_pensione_ammontare_in_euro": "Redditi da pensione",
+        "reddito_imponibile_ammontare_in_euro": "Reddito imponibile",
+        "laureati_res_femmine": "Laureate (donne)", "laureati_res_maschi": "Laureati (uomini)",
+        "laureati_res_tot": "Laureati", "numero_contribuenti": "Contribuenti",
+        "brevetti_num_prov": "Brevetti", "merci_scaricate_tonnellate": "Merci scaricate (t)",
+    }
+
+    def _pretty_metric(self, s: str) -> str:
+        parts = [p.strip() for p in str(s).split("/")]
+        return " / ".join(self.PRETTY.get(p, p.replace("_", " ").capitalize()) for p in parts if p)
+
+    RANDOM_METRICS = ["reddito_medio", "pop_totale", "laureati_pct", "gini_index",
+                      "imprese_attive_prov", "saldo_migratorio_pct",
+                      "reddito_da_pensione_ammontare_in_euro"]
+    RANDOM_COMUNI = ["Milano", "Roma", "Napoli", "Torino", "Bari", "Palermo", "Bologna",
+                     "Firenze", "Genova", "Venezia", "Cagliari", "Catania", "Verona", "Lecce"]
+
+    def _random_params(self) -> QueryParameters:
+        import random
+        metric = random.choice(self.RANDOM_METRICS)
+        if random.random() < 0.45:  # a volte una classifica
+            return QueryParameters(metrics=[metric], query_type=QueryType.RANKING,
+                                   top_n=random.choice([8, 10, 12]),
+                                   ascending=random.random() < 0.25,
+                                   level=random.choice(["comune", "regione"]))
+        comuni = random.sample(self.RANDOM_COMUNI, k=random.choice([1, 2, 3]))
+        return QueryParameters(comuni=comuni, metrics=[metric], query_type=QueryType.TIME_SERIES)
 
     def _period_label(self, df: pd.DataFrame, params: QueryParameters) -> str:
         if params.anno:
@@ -473,36 +509,60 @@ class SocioEconomicBot:
 
     # ---------- /map ----------
     async def map_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        msg_obj = update.message
+        msg_obj = update.message or (update.callback_query.message if getattr(update, "callback_query", None) else None)
+        user = update.effective_user
         text = " ".join(context.args) if context.args else ""
-        if not text:
-            await msg_obj.reply_text("🗺️ Sintassi: `/map <metrica> [anno]` es. `/map average_income 2023`", parse_mode=ParseMode.MARKDOWN)
-            return
+        random_mode = not text.strip()
+        processing = await msg_obj.reply_text(
+            "🎲 Genero una mappa casuale…" if random_mode else "🗺️ Preparo la mappa…")
         try:
-            anno = None
-            tokens = text.split()
-            metric = tokens[0]
-            if len(tokens) > 1 and tokens[1].isdigit():
-                anno = int(tokens[1])
-            params = QueryParameters(
-                query_type=QueryType.SINGLE_COMUNE, chart_type=ChartType.BAR,
-                metrics=[metric], anno=anno
-            )
-            # Otteniamo ultimo anno aggregato a livello regionale (o comunale se manca regioni)
+            import random
+            if random_mode:
+                metric, anno = random.choice(self.RANDOM_METRICS), None
+            else:
+                yr = re.search(r"(19|20)\d{2}", text)
+                anno = int(yr.group()) if yr else None
+                term = re.sub(r"(19|20)\d{2}", "", text).strip()
+                metric = self.llm_processor.resolve_metric(term) or term
+
+            params = QueryParameters(query_type=QueryType.SINGLE_COMUNE,
+                                     chart_type=ChartType.MAP, metrics=[metric], anno=anno)
             df, xlabel, ylabel, meta = self.df_manager.query_data_for_map(params)
             if df is None or df.empty:
-                await msg_obj.reply_text("❌ Nessun dato mappabile trovato per quella metrica/anno.")
+                await processing.edit_text(
+                    "❌ Nessun dato mappabile per questa metrica. Prova `/map reddito medio`.",
+                    parse_mode=ParseMode.MARKDOWN)
                 return
-            title = f"Mappa • {metric} • {anno or meta.get('latest_year','ultimo anno')}"
-            subtitle = self._subtitle_from_meta(meta)
+
+            pretty = self._pretty_metric(metric)
+            title = f"{pretty} per regione ({meta.get('map_year', '')})"
             png = self.map_generator.generate_choropleth(
-                df, metric_col=metric, level=meta.get("map_level", "regione"),
-                title=title, subtitle=subtitle
-            )
-            await msg_obj.reply_photo(BytesIO(png), caption=title, reply_markup=self.main_keyboard)
+                df, metric_col=metric, level="regione",
+                title=title, subtitle=self._subtitle_from_meta(meta))
+
+            caption = ("🎲 *Mappa casuale*\n" if random_mode else "") + f"*{title}*"
+            await msg_obj.reply_photo(BytesIO(png), caption=caption,
+                                      parse_mode=ParseMode.MARKDOWN, reply_markup=self.main_keyboard)
+
+            # commento: regione più alta / più bassa
+            try:
+                top = df.loc[df[metric].idxmax()]
+                bot = df.loc[df[metric].idxmin()]
+                comment = (f"🔎 *{pretty}* — più alto in *{top['regione'].title()}* "
+                           f"({top[metric]:,.0f}), più basso in *{bot['regione'].title()}* "
+                           f"({bot[metric]:,.0f}).").replace(",", ".")
+                await msg_obj.reply_text(comment, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                pass
+
+            try:
+                await processing.delete()
+            except Exception:
+                pass
+            log_message(user, title, "RESPONSE", "OUT", query_type="MAP", metrics=[metric])
         except Exception:
             logger.exception("Errore mappa")
-            await msg_obj.reply_text("❌ Errore durante la generazione della mappa.")
+            await processing.edit_text("❌ Errore durante la generazione della mappa.")
 
     # ---------- Run ----------
     def run(self):

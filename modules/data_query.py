@@ -120,7 +120,23 @@ class DataFrameManager:
 
         wide, x_col = self._shape_for_chart(df, params)
         xlabel, ylabel = self._labels(x_col, df, params)
-        return wide, xlabel, ylabel, self._meta
+        return wide, xlabel, ylabel, {**self._meta, "x_col": x_col}
+
+    # ------------------------------------------------------
+    # Sceglie il grafico più adatto dalla FORMA dei dati (non si fida solo del LLM)
+    # ------------------------------------------------------
+    @staticmethod
+    def choose_chart(x_col: str, df: pd.DataFrame, params: QueryParameters):
+        from modules import ChartType
+        if params.query_type == QueryType.RANKING:
+            return ChartType.BARH
+        if x_col == "anno":                      # tempo → linea
+            return ChartType.LINE
+        # asse categoriale (comune/regione/metrica)
+        labels = df[x_col].astype(str)
+        if len(df) > 8 or labels.str.len().max() > 10:
+            return ChartType.BARH                # tante voci / nomi lunghi → barre orizzontali
+        return ChartType.BAR
 
     # ------------------------------------------------------
     # Reshape long → wide, chart-ready. NEVER leaves the string 'comune'
@@ -221,22 +237,16 @@ class DataFrameManager:
         if not metric or metric not in df.columns:
             raise ValueError(f"Metrica non trovata: {metric}")
 
-        group = (
-            "regione"
-            if "regione" in df.columns
-            else "provincia"
-            if "provincia" in df.columns
-            else "comune"
-        )
-
-        anno = params.anno or df["anno"].max()
-        df = df[df["anno"] == anno]
-        df_map = df.groupby(group, as_index=False)[metric].mean()
-
-        xlabel = group.capitalize()
-        ylabel = metric
-        meta = self._meta | {"map_level": group}
-        return df_map, xlabel, ylabel, meta
+        # Maps are drawn at REGIONE level (we have a regions GeoJSON). Aggregate
+        # comuni → regione (mean).
+        group = self._level_column("regione")  # regione_mef
+        anno = int(params.anno or self.df["anno"].dropna().max())
+        d = df[df["anno"] == anno]
+        df_map = (d.groupby(group, as_index=False)[metric].mean()
+                    .dropna(subset=[metric])
+                    .rename(columns={group: "regione"}))
+        meta = self._meta | {"map_level": "regione", "map_year": anno}
+        return df_map, "Regione", metric, meta
 
     # ------------------------------------------------------
     # Classifiche (top/bottom N), con aggregazione territoriale

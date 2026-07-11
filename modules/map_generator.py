@@ -1,93 +1,119 @@
 import io
 import os
-from typing import Optional
-import pandas as pd
-import matplotlib.pyplot as plt
+import json
+import math
+import logging
+import unicodedata
 
-try:
-    import geopandas as gpd
-except Exception:
-    gpd = None
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import PathPatch
+from matplotlib.path import Path
+from matplotlib.collections import PatchCollection
+from matplotlib.colors import Normalize
+import matplotlib.cm as cm
+
+logger = logging.getLogger(__name__)
+
+# Regional choropleth WITHOUT geopandas: parse a GeoJSON of Italian regions and
+# draw the polygons with matplotlib. Join is by normalized region name.
+DEFAULT_GEOJSON = os.path.join("resources", "geo", "regioni.geojson")
+INK = "#1f2937"
+MUTE = "#6b7280"
+
+
+def _norm(s: str) -> str:
+    """'VALLE D'AOSTA' and 'Valle d'Aosta/Vallée d'Aoste' → 'valle d aosta'-ish match key."""
+    s = str(s).split("/")[0].strip().lower().replace("-", " ")
+    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    return " ".join(s.split())
+
+
+def _exterior_rings(geom: dict):
+    t = geom.get("type")
+    c = geom.get("coordinates", [])
+    if t == "Polygon":
+        return [c[0]] if c else []
+    if t == "MultiPolygon":
+        return [poly[0] for poly in c if poly]
+    return []
 
 
 class MapGenerator:
-    """
-    Genera coropleta regionale o comunale.
-    Richiede uno shapefile/geojson configurato via ENV:
-    - IT_REGIONI_GEOJSON (regioni)
-    - IT_COMUNI_GEOJSON (comuni) [opzionale]
-    Colonne attese: 'regione_norm' o 'comune' per join nominale.
-    """
-
     def __init__(self):
-        self.reg_path = os.getenv("IT_REGIONI_GEOJSON", "")
-        self.com_path = os.getenv("IT_COMUNI_GEOJSON", "")
+        self.geojson_path = os.getenv("IT_REGIONI_GEOJSON", DEFAULT_GEOJSON)
+        self._features = None
 
-    def generate_choropleth(self, df: pd.DataFrame, metric_col: str, level: str = "regione",
+    def _load(self):
+        if self._features is None:
+            with open(self.geojson_path, encoding="utf-8") as f:
+                self._features = json.load(f)["features"]
+        return self._features
+
+    def available(self) -> bool:
+        return os.path.exists(self.geojson_path)
+
+    def generate_choropleth(self, df, metric_col: str, level: str = "regione",
                             title: str = "", subtitle: str = "") -> bytes:
-        if gpd is None:
-            # Fallback: heatmap fake (bar chart sorted) se geopandas mancante
-            df_sorted = df.sort_values(metric_col, ascending=False).head(20)
-            fig, ax = plt.subplots(figsize=(8, 5))
-            ax.barh(df_sorted.iloc[:, 0], df_sorted[metric_col])
-            ax.set_title(title)
-            ax.set_xlabel(metric_col)
-            ax.invert_yaxis()
-            if subtitle:
-                plt.suptitle(subtitle, y=0.98, fontsize=9, color="#444")
-            buf = io.BytesIO()
-            plt.tight_layout()
-            plt.savefig(buf, format="png", dpi=150)
-            buf.seek(0)
-            plt.close()
-            return buf.getvalue()
+        """df: [<region col>, metric]. Renders an Italy regional choropleth."""
+        if not self.available():
+            return self._fallback_bar(df, metric_col, title, subtitle)
 
-        # Geopandas path
-        if level == "regione" and self.reg_path and os.path.exists(self.reg_path):
-            gdf = gpd.read_file(self.reg_path)
-            key_left = gdf.columns[0]  # we will try to guess
-            # Try to normalize name column
-            name_cols = [c for c in gdf.columns if "nome" in c.lower() or "reg" in c.lower()]
-            geo_name = name_cols[0] if name_cols else gdf.columns[0]
-            # Merge
-            left = gdf.rename(columns={geo_name: "regione_norm"})
-            right = df.rename(columns={df.columns[0]: "regione_norm"})
-            mg = left.merge(right, on="regione_norm", how="left")
-        elif level == "comune" and self.com_path and os.path.exists(self.com_path):
-            gdf = gpd.read_file(self.com_path)
-            name_cols = [c for c in gdf.columns if "comune" in c.lower() or "nome" in c.lower()]
-            geo_name = name_cols[0] if name_cols else gdf.columns[0]
-            left = gdf.rename(columns={geo_name: "comune"})
-            right = df.rename(columns={df.columns[0]: "comune"})
-            mg = left.merge(right, on="comune", how="left")
-        else:
-            # Fallback se file mancanti
-            df_sorted = df.sort_values(metric_col, ascending=False).head(20)
-            fig, ax = plt.subplots(figsize=(8, 5))
-            ax.barh(df_sorted.iloc[:, 0], df_sorted[metric_col])
-            ax.set_title(title)
-            ax.set_xlabel(metric_col)
-            ax.invert_yaxis()
-            if subtitle:
-                plt.suptitle(subtitle, y=0.98, fontsize=9, color="#444")
-            buf = io.BytesIO()
-            plt.tight_layout()
-            plt.savefig(buf, format="png", dpi=150)
-            buf.seek(0)
-            plt.close()
-            return buf.getvalue()
+        features = self._load()
+        name_col = df.columns[0]
+        values = {_norm(r[name_col]): float(r[metric_col])
+                  for _, r in df.dropna(subset=[metric_col]).iterrows()}
 
-        # Plot
-        fig, ax = plt.subplots(figsize=(8.8, 9.2))
-        mg.plot(column=metric_col, ax=ax, legend=True, cmap="viridis", missing_kwds={"color": "lightgrey"})
-        ax.set_axis_off()
-        ax.set_title(title)
+        patches, vals = [], []
+        for feat in features:
+            key = _norm(feat["properties"].get("reg_name", ""))
+            v = values.get(key, np.nan)
+            for ring in _exterior_rings(feat["geometry"]):
+                patches.append(PathPatch(Path(np.asarray(ring))))
+                vals.append(v)
+
+        vals = np.array(vals, dtype=float)
+        finite = vals[np.isfinite(vals)]
+        norm = Normalize(vmin=finite.min(), vmax=finite.max()) if finite.size else Normalize(0, 1)
+        cmap = cm.get_cmap("viridis").copy()
+        cmap.set_bad("#e5e7eb")  # regions without data → light grey
+
+        fig, ax = plt.subplots(figsize=(7.2, 8.4), dpi=200)
+        pc = PatchCollection(patches, cmap=cmap, norm=norm, edgecolor="white", linewidth=0.5)
+        pc.set_array(vals)
+        ax.add_collection(pc)
+        ax.autoscale_view()
+        ax.set_aspect(1.32)  # Italy ~42°N: makes the boot look natural
+        ax.axis("off")
+
+        cbar = fig.colorbar(pc, ax=ax, fraction=0.035, pad=0.02, shrink=0.7)
+        cbar.ax.tick_params(labelsize=8, colors=MUTE)
+        cbar.outline.set_visible(False)
+
+        fig.suptitle(title, fontsize=15, fontweight="bold", color=INK, x=0.05, ha="left", y=0.97)
         if subtitle:
-            plt.suptitle(subtitle, y=0.98, fontsize=9, color="#444")
+            ax.set_title(subtitle, fontsize=10, color=MUTE, loc="left")
+        fig.text(0.98, 0.02, "SocioEconomicBot", ha="right", fontsize=8, color="#b0b4bb")
 
         buf = io.BytesIO()
-        plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=150)
+        fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
         buf.seek(0)
-        plt.close()
+        plt.close(fig)
+        return buf.getvalue()
+
+    def _fallback_bar(self, df, metric_col, title, subtitle):
+        d = df.sort_values(metric_col, ascending=False).head(20)
+        fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
+        ax.barh(d.iloc[:, 0].astype(str), d[metric_col], color="#2563eb")
+        ax.invert_yaxis()
+        ax.set_title(title, loc="left", fontweight="bold")
+        if subtitle:
+            fig.suptitle(subtitle, y=0.98, fontsize=9, color=MUTE)
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", dpi=150)
+        buf.seek(0)
+        plt.close(fig)
         return buf.getvalue()
