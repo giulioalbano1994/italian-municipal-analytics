@@ -1,44 +1,74 @@
 # Italian Municipal Analytics Bot
 
-A Telegram bot that answers plain-language questions — in **Italian or English** —
-about the socio-economic profile of Italian municipalities, and replies with a
-chart or map plus a short written analysis.
+**Natural-language access to official Italian municipal statistics — a question in
+plain language returns a rigorous chart or map and a written analysis in seconds.**
 
-> _"Reddito medio Bari e Napoli nel tempo"_ · _"Classifica 10 comuni più ricchi"_ ·
+> _"Reddito medio Bari e Napoli nel tempo"_ · _"Classifica dei 10 comuni più ricchi"_ ·
 > _"Laureati per regione"_ · _"/map reddito medio"_
 
-Author: **Giulio Albano** — University of Bari (UNIBA), PhD in Economics and Finance
-of Public Administrations.
+Author: **Giulio Albano** — University of Bari (UNIBA), PhD in Economics and Finance of
+Public Administrations.
 
 ---
 
-## What it does
+## Why it matters
 
-- **Natural language, two languages.** Ask a question; the bot detects the indicator,
-  the municipalities (or regions/provinces), the time window, and the intent.
-- **Real column mapping.** The full variable dictionary (name + description + synonyms)
-  is fed to the LLM, and a resolver maps every requested term to an actual dataset
-  column — so almost all 80+ variables are answerable, not just a hardcoded few.
-- **The system picks the chart.** Chart type is chosen from the *shape* of the data,
-  not guessed by the model: time → line, few categories → bars, many/long labels →
-  horizontal bars, ranking → horizontal bars.
-- **Comparison.** `Reddito medio Bari e Napoli nel tempo` draws one line per city.
-- **Rankings.** `Classifica dei 10 comuni più ricchi`, top/bottom N, by municipality,
-  province, or region.
-- **Regional maps.** Choropleth of Italy by region — rendered from a GeoJSON with
-  pure matplotlib (no geopandas dependency).
-- **Random mode.** `/plot` and `/map` with no text generate a random, sensible
-  chart/map — a one-tap tour of what the bot can do.
-- **Written analysis.** An LLM commentary (headline + three insights + bottom line,
-  Italian, Telegram-formatted) accompanies each answer; a numeric summary is used
-  when no LLM key is set.
-- **Guardrails.** Per-user rate limiting, nonsense filtering, and a lightweight
-  classifier that routes help/info/offensive messages.
+Official statistics on Italy's 8,000 municipalities are rich but hard to use: dozens of
+technical variables, spread across ISTAT, MEF, MIUR, Infocamere and Eurostat, normally
+reachable only by someone who can write code. This project removes that barrier — anyone
+can ask a question in ordinary Italian or English and get a publication-quality answer.
+
+**Methodological principle (the important part).** The language model *never produces the
+numbers*. It only translates the user's question into a **structured query** over the
+official dataset; every value shown is read directly from the source data and can be
+traced back to it. This is the correct pattern for combining AI with official statistics:
+the model decides *what to fetch and how to display it*, the data provides *the figures*.
+
+## What it can answer
+
+**Compare places over time** — one clean line per municipality.
+
+![Comparison](docs/images/compare_income.png)
+
+**Rank municipalities, provinces or regions** — top or bottom N, by any indicator.
+
+![Ranking](docs/images/ranking_regions.png)
+
+**Map any indicator across Italy** — regional choropleth, rendered without geopandas.
+
+![Map](docs/images/map_reddito.png)
+
+Plus: single-place time series, territorial aggregation (municipality → province → region),
+and a **random mode** (`/plot`, `/map`) that showcases the range in one tap. Every answer is
+accompanied by a short written commentary (headline, three insights, bottom line).
+
+## How it works — the pipeline
+
+```
+user message
+   │
+   ▼  1. intent gate          classifier: data / help / info / nonsense (+ rate limiting)
+   ▼  2. structured parse     LLM turns the question into parameters (places, indicator,
+   │                             period, intent). The REAL variable catalog — 80+ column
+   │                             names + descriptions + synonyms — is injected into the
+   │                             prompt, so the model maps questions to actual variables.
+   ▼  3. metric resolver      each returned term is matched to a real column
+   │                             (exact → synonym → fuzzy); unknown terms are dropped, never
+   │                             silently charted as empty.
+   ▼  4. query & reshape      filter on 196k rows, reshape long→wide (one series per place)
+   ▼  5. choose the view      chart type is decided from the DATA SHAPE, not guessed by the
+   │                             model (time → line, few categories → bars, many → horizontal
+   │                             bars, ranking → horizontal bars), or a regional map
+   ▼  6. render               Matplotlib chart / GeoJSON choropleth
+   ▼  7. commentary           LLM writes a short, grounded analysis (numbers only)
+   ▼
+ reply (image + text)
+```
 
 ## Data
 
-A single local table of ~196k rows × ~80 columns covering Italian municipalities
-across years, assembled from official sources:
+A single local table, **~196,000 rows × ~80 variables**, covering Italian municipalities
+over time, assembled and normalised from official sources:
 
 | Domain | Examples | Source |
 |---|---|---|
@@ -46,12 +76,28 @@ across years, assembled from official sources:
 | Population & migration | resident population, migration balance | ISTAT |
 | Education | graduates (total / women / men) | MIUR |
 | Inequality | Gini index | derived |
-| Firms | active / registered firms, patents | Infocamere |
+| Firms & innovation | active / registered firms, patents | Infocamere |
 | Territory | region, province, NUTS3, capoluogo flag | ISTAT / Eurostat |
 
-The variable dictionary lives in `resources/dizionario_variabili.csv`
-(name, source, description, synonyms). Derived metrics (e.g. `reddito_medio`,
-`laureati_pct`) are computed at load time.
+A machine-readable **variable dictionary** (`resources/dizionario_variabili.csv`: name,
+source, description, synonyms) documents every field and powers the LLM's column mapping.
+Derived indicators (`reddito_medio`, `laureati_pct`, …) are computed at load time.
+
+## Engineering highlights
+
+- **Catalog-driven prompting.** The model is given the real schema (80+ columns + synonyms)
+  instead of a handful of hardcoded terms — turning "a few answerable questions" into "almost
+  any variable in the dataset", in two languages.
+- **Deterministic view selection.** The chart is chosen from the shape of the data, so the
+  output is predictable and correct regardless of model phrasing.
+- **Maps without heavy dependencies.** The regional choropleth is drawn from a GeoJSON with
+  plain `json` + matplotlib (no geopandas), joined to the data by robust name-normalization
+  (accents, hyphens and bilingual ISTAT region names all handled).
+- **Performance.** The dataset is read once; queries filter the frame directly (no per-request
+  copy) with a precomputed key, and LLM parses are cached — sub-100 ms per query on 196k rows.
+- **Correctness & robustness.** Long→wide reshaping prevents phantom series; unknown metrics
+  are dropped rather than mischarted; commentary is Telegram-safe with a plain-text fallback;
+  per-user rate limiting and a nonsense filter protect the service.
 
 ## Architecture
 
@@ -63,16 +109,12 @@ modules/
   data_query.py              filtering, long→wide reshaping, ranking, chart-type choice
   chart_generator.py         Matplotlib charts (line / bar / barh / pie)
   map_generator.py           regional choropleth from GeoJSON (no geopandas)
-  classifier.py              lightweight intent gate (data / help / info / nonsense)
+  classifier.py              lightweight intent gate
 resources/
-  df_ridotto_bot.csv         the municipal dataset (local, git-ignored)
+  df_ridotto_bot.csv         municipal dataset (local, git-ignored)
   dizionario_variabili.csv   variable dictionary
   geo/regioni.geojson        Italian regions boundaries (local, git-ignored)
 ```
-
-**Request lifecycle:** message → classifier → LLM parse (indicator + places + period
-+ intent) → resolve metrics to real columns → query & reshape → choose chart / build
-map → render → LLM commentary → reply.
 
 ## Setup
 
@@ -80,22 +122,19 @@ Requires Python 3.10+.
 
 ```bash
 python -m venv .venv
-# Windows:  .venv\Scripts\activate
-# macOS/Linux:  source .venv/bin/activate
+# Windows:  .venv\Scripts\activate  ·  macOS/Linux:  source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Configuration via `.env` (in the project root):
+Configuration via `.env` in the project root:
 
 | Variable | Required | Purpose |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | ✅ | BotFather token |
 | `OPENAI_API_KEY` | optional | OpenAI (`sk-…`) — enables LLM parsing & commentary |
-| `IT_REGIONI_GEOJSON` | optional | Path to the regions GeoJSON (defaults to `resources/geo/regioni.geojson`) |
+| `IT_REGIONI_GEOJSON` | optional | Regions GeoJSON path (default `resources/geo/regioni.geojson`) |
 
-Without an OpenAI key the processor falls back to Gemini (if configured) or to a
-deterministic path. The real `.env`, the dataset, and the GeoJSON are git-ignored —
-never commit tokens or data.
+The real `.env`, the dataset and the GeoJSON are git-ignored — never commit tokens or data.
 
 ## Run
 
@@ -112,32 +151,18 @@ Reddito medio Bari e Napoli nel tempo      # comparison → two lines
 Classifica dei 10 comuni più ricchi        # ranking
 Laureati per regione                       # aggregation
 /map reddito medio                         # regional choropleth
-/plot                                      # random chart
-/map                                       # random map
+/plot   ·   /map                           # random chart / map
 ```
-
-## Robustness & performance
-
-- **No per-query DataFrame copy** — filters run directly on the loaded frame; a
-  lowercase municipality key is precomputed once. The dataset is read a single time.
-- **Long→wide reshaping** before charting, so string columns are never plotted as a
-  data series (the classic phantom "= 0" line).
-- **LLM parses are cached** per normalized question.
-- **Choropleth without geopandas** — GeoJSON parsed with `json`, drawn with
-  matplotlib; regions joined to data by name-normalization (accents, hyphens, and
-  bilingual ISTAT names handled).
-- **Telegram-safe text** — commentary avoids Markdown headers and falls back to
-  plain text if a message fails to parse.
 
 ## Limits & notes
 
-- Maps are at **regional** level (a regions GeoJSON is bundled locally); province-level
-  maps would need a provinces GeoJSON.
-- LLM commentary via OpenAI/Gemini incurs cost; validate and monitor your key.
+- Maps are at **regional** level (a regions GeoJSON is bundled locally); province-level maps
+  would need a provinces GeoJSON.
+- LLM usage (OpenAI/Gemini) incurs cost; validate and monitor your key.
 - Data availability follows the underlying official sources.
 
 ## Attribution
 
 Data: ISTAT, MEF, MIUR, Infocamere, Eurostat. Region boundaries:
 [openpolis / geojson-italy](https://github.com/openpolis/geojson-italy). Built with
-`python-telegram-bot`, pandas, and matplotlib.
+`python-telegram-bot`, pandas and matplotlib.
